@@ -1,0 +1,226 @@
+---
+title: "BET inhibition by JQ1 in CD4+ memory and effector T cells: a paired DESeq2 analysis"
+author: "Patricia K. Kamanda"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: kable
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 7, fig.height = 5,
+                      dpi = 120, fig.path = "results/figures/")
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(apeglm)
+  library(ggplot2)
+  library(ggrepel)
+  library(pheatmap)
+  library(dplyr)
+})
+set.seed(20261117)
+theme_set(theme_bw(base_size = 12))
+```
+
+## Question and data
+
+Peeters and colleagues (2015) treated CD4+ memory and effector T cells from patients with juvenile idiopathic arthritis (JIA) and from healthy controls with JQ1, a small-molecule inhibitor of the BET family of bromodomain proteins, and profiled them by RNA sequencing (GEO series GSE71595). Every donor contributes one untreated and one JQ1-treated sample, so the design is paired: four healthy donors and three patients, fourteen libraries in all. This analysis asks three questions:
+
+1. Which genes does JQ1 change, once the differences between donors are accounted for?
+2. Is the response to JQ1 the same in cells from patients and from healthy donors?
+3. Does a known pharmacodynamic marker of BET inhibition behave as expected, as a check on the whole analysis?
+
+```{r data}
+counts   <- read.delim("data/raw_counts.tsv", row.names = 1, check.names = FALSE)
+metadata <- read.delim("data/sample_metadata.tsv")
+genes    <- read.delim("data/gene_annotation.tsv", colClasses = c(gene_id = "character"))
+
+metadata <- metadata |>
+  mutate(diagnosis = factor(diagnosis, levels = c("Healthy", "JIA")),
+         treatment = factor(treatment, levels = c("Control", "JQ1")),
+         donor     = factor(donor))
+rownames(metadata) <- metadata$sample
+stopifnot(identical(colnames(counts), rownames(metadata)))
+metadata[, c("donor", "diagnosis", "treatment")]
+```
+
+## Filtering and library sizes
+
+Genes are kept if at least three samples have ten or more reads, the size of the smallest group of donors.
+
+```{r filter}
+keep <- rowSums(counts >= 10) >= 3
+counts_filtered <- as.matrix(counts[keep, ])
+library_sizes <- data.frame(sample = colnames(counts), reads_millions = colSums(counts) / 1e6)
+summary(library_sizes$reads_millions)
+```
+
+Of `r format(nrow(counts), big.mark = ",")` genes in the count table, `r format(sum(keep), big.mark = ",")` pass the filter. Library sizes range from `r round(min(library_sizes$reads_millions), 1)` to `r round(max(library_sizes$reads_millions), 1)` million reads.
+
+## Exploratory analysis
+
+The variance-stabilizing transformation puts counts on a scale on which distances between samples are meaningful.
+
+```{r pca, fig.cap = "Principal components of the variance-stabilized counts."}
+dds_explore <- DESeqDataSetFromMatrix(counts_filtered, metadata, design = ~ 1)
+vsd <- vst(dds_explore, blind = TRUE)
+pca <- plotPCA(vsd, intgroup = c("diagnosis", "treatment", "donor"), returnData = TRUE)
+pct <- round(100 * attr(pca, "percentVar"))
+ggplot(pca, aes(PC1, PC2, colour = treatment, shape = diagnosis)) +
+  geom_line(aes(group = donor), colour = "grey70") +
+  geom_point(size = 3.5) +
+  labs(x = paste0("PC1 (", pct[1], "% of variance)"), y = paste0("PC2 (", pct[2], "% of variance)"),
+       colour = "Treatment", shape = "Diagnosis")
+```
+
+Grey lines join the two samples from each donor. The first component, which carries half of the variance, separates patients from healthy donors; because the patients' cells were taken from the site of inflammation (GEO series description), diagnosis cannot be distinguished from tissue source in this design, and the analysis does not try to. The second component carries the treatment: within every donor, the JQ1-treated sample sits below its control. Because donors differ from one another far more than the two samples of any one donor differ, a paired model that removes donor effects is much more powerful than an unpaired comparison.
+
+```{r distances, fig.cap = "Euclidean distances between samples on the variance-stabilized scale.", fig.height = 5.5}
+sample_distances <- as.matrix(dist(t(assay(vsd))))
+annotation_col <- metadata[, c("diagnosis", "treatment")]
+pheatmap(sample_distances, annotation_col = annotation_col, show_colnames = FALSE,
+         labels_row = paste(metadata$donor, metadata$treatment), border_color = NA)
+```
+
+## Question 1: the effect of JQ1, paired by donor
+
+Including donor in the design compares each donor's treated sample with that donor's own control, so that differences between people do not dilute the treatment effect.
+
+```{r paired}
+dds <- DESeqDataSetFromMatrix(counts_filtered, metadata, design = ~ donor + treatment)
+dds <- DESeq(dds)
+res <- results(dds, name = "treatment_JQ1_vs_Control", alpha = 0.05)
+res_shrunk <- lfcShrink(dds, coef = "treatment_JQ1_vs_Control", type = "apeglm", res = res)
+summary(res, alpha = 0.05)
+```
+
+```{r annotate}
+annotate <- function(result) {
+  as.data.frame(result) |>
+    tibble::rownames_to_column("gene_id") |>
+    left_join(genes, by = "gene_id") |>
+    mutate(symbol = coalesce(symbol, gene_id)) |>
+    arrange(padj)
+}
+jq1 <- annotate(res_shrunk)
+write.csv(jq1, "results/tables/jq1_vs_control_paired.csv", row.names = FALSE)
+
+significant <- jq1 |> filter(padj < 0.05)
+n_up   <- sum(significant$log2FoldChange > 0)
+n_down <- sum(significant$log2FoldChange < 0)
+n_big  <- sum(abs(significant$log2FoldChange) >= 1)
+head(jq1 |> select(symbol, baseMean, log2FoldChange, lfcSE, padj), 15)
+```
+
+At a false discovery rate of 5%, JQ1 changes the expression of `r format(nrow(significant), big.mark = ",")` genes, `r format(n_up, big.mark = ",")` up and `r format(n_down, big.mark = ",")` down, of which `r format(n_big, big.mark = ",")` change at least twofold. Fold changes are shrunk with apeglm, which pulls noisy estimates from weakly expressed genes toward zero and makes the ranking by effect size more reliable.
+
+```{r volcano, fig.cap = "JQ1 versus control, paired by donor. The twenty genes with the smallest adjusted p-values are labelled."}
+plot_data <- jq1 |> filter(!is.na(padj)) |>
+  mutate(class = case_when(padj < 0.05 & log2FoldChange >=  1 ~ "Up, at least twofold",
+                           padj < 0.05 & log2FoldChange <= -1 ~ "Down, at least twofold",
+                           padj < 0.05                       ~ "Significant, under twofold",
+                           TRUE                              ~ "Not significant"))
+ggplot(plot_data, aes(log2FoldChange, -log10(padj), colour = class)) +
+  geom_point(size = 0.8, alpha = 0.6) +
+  geom_text_repel(data = head(plot_data, 20), aes(label = symbol), colour = "black", size = 3,
+                  max.overlaps = 30) +
+  scale_colour_manual(values = c("Up, at least twofold" = "#C0392B", "Down, at least twofold" = "#2471A3",
+                                 "Significant, under twofold" = "#A6ACAF", "Not significant" = "#E5E7E9")) +
+  labs(x = "log2 fold change, JQ1 versus control (apeglm)", y = "-log10 adjusted p-value", colour = NULL)
+```
+
+```{r ma, fig.cap = "MA plot: shrunken log2 fold change against mean normalized count."}
+ggplot(plot_data, aes(log10(baseMean), log2FoldChange, colour = padj < 0.05)) +
+  geom_point(size = 0.6, alpha = 0.5) +
+  geom_hline(yintercept = 0, colour = "grey40") +
+  scale_colour_manual(values = c(`FALSE` = "#BDC3C7", `TRUE` = "#C0392B"), labels = c("Not significant", "FDR < 0.05")) +
+  labs(x = "log10 mean normalized count", y = "log2 fold change (apeglm)", colour = NULL)
+```
+
+```{r heatmap, fig.cap = "The forty most significant genes, variance-stabilized and centred on each gene's mean.", fig.height = 8}
+top <- head(jq1$gene_id[!is.na(jq1$padj)], 40)
+mat <- assay(vsd)[top, ]
+mat <- mat - rowMeans(mat)
+rownames(mat) <- jq1$symbol[match(top, jq1$gene_id)]
+pheatmap(mat, annotation_col = annotation_col, show_colnames = FALSE, border_color = NA,
+         fontsize_row = 8, cluster_cols = TRUE)
+```
+
+## Question 2: is the response the same in patients and healthy donors?
+
+To compare the treatment effect between groups while keeping the pairing, donors are nested within diagnosis, following the DESeq2 recommendation for group-specific condition effects with individuals nested within groups. Because the JIA group has three donors and the healthy group four, the model matrix contains one column of zeros, which is removed before fitting.
+
+```{r interaction}
+metadata_nested <- metadata |>
+  group_by(diagnosis) |>
+  mutate(donor_n = factor(as.integer(factor(as.character(donor))))) |>
+  ungroup() |>
+  as.data.frame()
+rownames(metadata_nested) <- metadata_nested$sample
+
+model <- model.matrix(~ diagnosis + diagnosis:donor_n + diagnosis:treatment, metadata_nested)
+model <- model[, colSums(model != 0) > 0]
+colnames(model)
+
+dds_group <- DESeqDataSetFromMatrix(counts_filtered, metadata_nested, design = ~ 1)
+dds_group <- DESeq(dds_group, full = model)
+
+res_healthy <- results(dds_group, name = "diagnosisHealthy.treatmentJQ1", alpha = 0.05)
+res_jia     <- results(dds_group, name = "diagnosisJIA.treatmentJQ1", alpha = 0.05)
+res_diff    <- results(dds_group, contrast = list("diagnosisJIA.treatmentJQ1", "diagnosisHealthy.treatmentJQ1"),
+                       alpha = 0.05)
+
+write.csv(annotate(res_healthy), "results/tables/jq1_effect_healthy.csv", row.names = FALSE)
+write.csv(annotate(res_jia),     "results/tables/jq1_effect_jia.csv", row.names = FALSE)
+write.csv(annotate(res_diff),    "results/tables/jq1_effect_jia_minus_healthy.csv", row.names = FALSE)
+
+n_healthy <- sum(res_healthy$padj < 0.05, na.rm = TRUE)
+n_jia     <- sum(res_jia$padj < 0.05, na.rm = TRUE)
+n_diff    <- sum(res_diff$padj < 0.05, na.rm = TRUE)
+```
+
+Within each group, JQ1 changes `r format(n_healthy, big.mark = ",")` genes in cells from healthy donors and `r format(n_jia, big.mark = ",")` genes in cells from patients at a false discovery rate of 5%. The test of whether the treatment effect differs between the groups finds `r format(n_diff, big.mark = ",")` genes.
+
+```{r concordance, fig.cap = "Treatment effect in patients against treatment effect in healthy donors, for genes that respond in either group."}
+both <- data.frame(gene_id = rownames(res_healthy),
+                   healthy = res_healthy$log2FoldChange, jia = res_jia$log2FoldChange,
+                   responds = (res_healthy$padj < 0.05 | res_jia$padj < 0.05)) |>
+  filter(responds %in% TRUE)
+r_value <- cor(both$healthy, both$jia)
+ggplot(both, aes(healthy, jia)) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey50", linetype = 2) +
+  geom_point(size = 0.7, alpha = 0.5, colour = "#2471A3") +
+  labs(x = "log2 fold change, healthy donors", y = "log2 fold change, JIA patients",
+       subtitle = paste0("Pearson r = ", round(r_value, 2), " across ", format(nrow(both), big.mark = ","), " responsive genes"))
+```
+
+The correlation between the two groups' fold changes is `r round(r_value, 2)` across the genes that respond in either group. With three patients and four controls, the interaction test has limited power, so a small number of significant differences should not be read as evidence that the responses are identical.
+
+## Question 3: a positive control
+
+HEXIM1 is among the most consistently induced genes after BET bromodomain inhibition and is widely used as a pharmacodynamic marker of target engagement. If the data and the model are sound, it should rise in JQ1-treated cells from every donor.
+
+```{r hexim1, fig.cap = "Normalized HEXIM1 counts in each donor's control and JQ1-treated sample."}
+hexim1_id <- genes$gene_id[genes$symbol == "HEXIM1"][1]
+hexim1 <- plotCounts(dds, gene = hexim1_id, intgroup = c("donor", "treatment", "diagnosis"), returnData = TRUE)
+ggplot(hexim1, aes(treatment, count, group = donor, colour = diagnosis)) +
+  geom_line() + geom_point(size = 2.5) +
+  scale_y_log10() +
+  labs(x = NULL, y = "Normalized count (log scale)", colour = "Diagnosis")
+jq1 |> filter(symbol == "HEXIM1") |> select(symbol, baseMean, log2FoldChange, lfcSE, padj)
+```
+
+## Conclusions
+
+```{r conclusions, echo = FALSE}
+hex <- jq1[jq1$symbol == "HEXIM1", ]
+```
+
+Accounting for donor, JQ1 alters the expression of `r format(nrow(significant), big.mark = ",")` genes in CD4+ memory and effector T cells. HEXIM1, the expected marker of BET inhibition, changes by a shrunken log2 fold change of `r round(hex$log2FoldChange, 2)` (adjusted p = `r signif(hex$padj, 2)`), which supports the soundness of the data and the model. The response is broadly shared between patients and healthy donors, and the small number of groups makes the comparison between them exploratory. Gene-level results for every comparison are in `results/tables/`.
+
+## Session information
+
+```{r session}
+sessionInfo()
+```

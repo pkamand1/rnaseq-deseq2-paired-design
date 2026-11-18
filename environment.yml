@@ -1,0 +1,17 @@
+# Software used to run analysis.Rmd. Create with:  mamba env create -f environment.yml
+name: rnaseq-deseq2-paired-design
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - r-base=4.4
+  - bioconductor-deseq2=1.46.0
+  - bioconductor-apeglm=1.28.0
+  - r-ggplot2=4.0.4
+  - r-ggrepel
+  - r-pheatmap=1.0.13
+  - r-dplyr
+  - r-tibble
+  - r-rmarkdown=2.32
+  - r-knitr
+  - pandoc
